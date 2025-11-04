@@ -1,7 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { StyleSheet, Text, View, TouchableOpacity, Alert, Platform } from 'react-native';
 import MapView, { Marker } from 'react-native-maps';
-import { Pedometer } from 'expo-sensors';
+import { Accelerometer, Gyroscope } from 'expo-sensors';
 import * as Location from 'expo-location';
 import { createClient } from '@supabase/supabase-js';
 import * as Network from 'expo-network';
@@ -12,30 +12,88 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 export default function FitnessTracker() {
   const [stepCount, setStepCount] = useState(0);
   const [location, setLocation] = useState(null);
-  const [isPedometerAvailable, setIsPedometerAvailable] = useState('checking');
   const [deviceIP, setDeviceIP] = useState(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [sensorStatus, setSensorStatus] = useState('Initialisiere...');
 
-  // Schrittzähler initialisieren
+  // Referenzen für Schritt-Erkennung
+  const lastStepTime = useRef(Date.now());
+  const accelerationHistory = useRef([]);
+  const stepThreshold = useRef(1.3); // Schwellenwert für Schritterkennung (empfindlicher)
+  const gravityFilter = useRef({ x: 0, y: 0, z: 0 }); // Gleitender Durchschnitt für Gravitation
+
+  // Schrittzähler mit Accelerometer
   useEffect(() => {
-    let subscription;
+    let accelerometerSubscription;
+    
+    const startStepDetection = async () => {
+      try {
+        // Setze Aktualisierungsrate (100ms = 10Hz)
+        Accelerometer.setUpdateInterval(100);
 
-    const subscribeToPedometer = async () => {
-      const isAvailable = await Pedometer.isAvailableAsync();
-      setIsPedometerAvailable(String(isAvailable));
+        accelerometerSubscription = Accelerometer.addListener(({ x, y, z }) => {
+          // Low-Pass Filter für Gravitation (gleitender Durchschnitt)
+          const alpha = 0.8; // Filterstärke (0.8 = starke Glättung)
+          gravityFilter.current.x = alpha * gravityFilter.current.x + (1 - alpha) * x;
+          gravityFilter.current.y = alpha * gravityFilter.current.y + (1 - alpha) * y;
+          gravityFilter.current.z = alpha * gravityFilter.current.z + (1 - alpha) * z;
 
-      if (isAvailable) {
-        subscription = Pedometer.watchStepCount(result => {
-          setStepCount(result.steps);
+          // Entferne Gravitation (High-Pass Filter)
+          const linearAccelX = x - gravityFilter.current.x;
+          const linearAccelY = y - gravityFilter.current.y;
+          const linearAccelZ = z - gravityFilter.current.z;
+
+          // Berechne die Magnitude der linearen Beschleunigung (ohne Gravitation)
+          const acceleration = Math.sqrt(
+            linearAccelX * linearAccelX + 
+            linearAccelY * linearAccelY + 
+            linearAccelZ * linearAccelZ
+          );
+
+          // Füge zur History hinzu (letzte 10 Werte für bessere Glättung)
+          accelerationHistory.current.push(acceleration);
+          if (accelerationHistory.current.length > 10) {
+            accelerationHistory.current.shift();
+          }
+
+          // Erkenne Schritte nur wenn genug Daten vorhanden
+          if (accelerationHistory.current.length === 10) {
+            const current = accelerationHistory.current[5]; // Mittlerer Wert
+            const prev1 = accelerationHistory.current[4];
+            const prev2 = accelerationHistory.current[3];
+            const next1 = accelerationHistory.current[6];
+            const next2 = accelerationHistory.current[7];
+
+            // Peak-Erkennung: Deutlicher Berg in den Daten
+            const isPeak = 
+              current > stepThreshold.current &&
+              current > prev1 && 
+              current > next1;
+
+            // Zeitfilter: Mindestens 250ms zwischen Schritten
+            const timeSinceLastStep = Date.now() - lastStepTime.current;
+
+            if (isPeak && timeSinceLastStep > 250) {
+              console.log('🚶 Schritt erkannt! Beschleunigung:', current.toFixed(2), 'm/s²');
+              lastStepTime.current = Date.now();
+              setStepCount(prev => prev + 1);
+            }
+          }
         });
+
+        setSensorStatus('✅ Aktiv');
+        console.log('✅ Schrittzähler gestartet - Threshold:', stepThreshold.current);
+      } catch (error) {
+        console.error('Fehler beim Starten des Accelerometers:', error);
+        setSensorStatus('❌ Fehler');
       }
     };
 
-    subscribeToPedometer();
+    startStepDetection();
 
     return () => {
-      if (subscription) {
-        subscription.remove();
+      if (accelerometerSubscription) {
+        accelerometerSubscription.remove();
       }
     };
   }, []);
@@ -143,20 +201,42 @@ export default function FitnessTracker() {
     }
   };
 
+  // Schritte zurücksetzen
+  const resetSteps = () => {
+    Alert.alert(
+      'Schritte zurücksetzen?',
+      'Möchtest du den Schrittzähler auf 0 setzen?',
+      [
+        { text: 'Abbrechen', style: 'cancel' },
+        { 
+          text: 'Zurücksetzen', 
+          style: 'destructive',
+          onPress: () => {
+            setStepCount(0);
+            console.log('🔄 Schrittzähler zurückgesetzt');
+          }
+        },
+      ]
+    );
+  };
+
   return (
     <View style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.title}>Fitness Tracker</Text>
-        <Text style={styles.subtitle}>Schritte & GPS</Text>
+        <Text style={styles.subtitle}>Accelerometer Schrittzähler</Text>
       </View>
 
       {/* Schrittzähler Anzeige */}
       <View style={styles.stepContainer}>
-        <Text style={styles.stepLabel}>Schritte heute</Text>
+        <Text style={styles.stepLabel}>Schritte (seit App-Start)</Text>
         <Text style={styles.stepCount}>{stepCount}</Text>
         <Text style={styles.deviceInfo}>
-          IP: {deviceIP || 'Wird geladen...'}
+          Sensor: {sensorStatus} | IP: {deviceIP || 'Lädt...'}
         </Text>
+        <TouchableOpacity style={styles.resetButton} onPress={resetSteps}>
+          <Text style={styles.resetButtonText}>🔄 Zurücksetzen</Text>
+        </TouchableOpacity>
       </View>
 
       {/* Karte */}
@@ -199,10 +279,9 @@ export default function FitnessTracker() {
         </Text>
       </TouchableOpacity>
 
-      {/* Status Info */}
-      <Text style={styles.statusText}>
-        Schrittzähler: {isPedometerAvailable === 'true' ? '✅' : '❌'} | 
-        GPS: {location ? '✅' : '⏳'}
+      {/* Info Text */}
+      <Text style={styles.infoText}>
+        💡 Gehe mit dem Handy in der Hand oder Tasche, um Schritte zu zählen
       </Text>
     </View>
   );
@@ -256,8 +335,20 @@ const styles = StyleSheet.create({
     color: '#999',
     marginTop: 10,
   },
+  resetButton: {
+    marginTop: 15,
+    paddingVertical: 8,
+    paddingHorizontal: 20,
+    backgroundColor: '#FF9800',
+    borderRadius: 8,
+  },
+  resetButtonText: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: '600',
+  },
   mapContainer: {
-    height: 300,
+    height: 250,
     marginHorizontal: 20,
     borderRadius: 15,
     overflow: 'hidden',
@@ -299,6 +390,7 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.2,
     shadowRadius: 4,
     elevation: 4,
+    marginBottom: 15,
   },
   saveButtonDisabled: {
     backgroundColor: '#B0BEC5',
@@ -308,10 +400,10 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: 'bold',
   },
-  statusText: {
+  infoText: {
     textAlign: 'center',
-    marginTop: 15,
     fontSize: 12,
     color: '#999',
+    marginHorizontal: 40,
   },
 });
