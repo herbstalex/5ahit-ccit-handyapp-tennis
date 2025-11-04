@@ -12,3 +12,8 @@ CREATE TABLE fitness_tracking (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 ```
+
+```sh
+npx expo install expo-sensors expo-location react-native-maps expo-network
+npm install @supabase/supabase-js
+```
